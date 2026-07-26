@@ -1,0 +1,24 @@
+[Unit]
+Description=Kaizen Video Analyst (Django)
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/kaizen
+Environment="DJANGO_SETTINGS_MODULE=kaizen.settings"
+Environment="GEMINI_API_KEY=YOUR_KEY_HERE"
+Environment="ALLOWED_HOSTS=yourdomain.com 127.0.0.1"
+Environment="DJANGO_SECRET_KEY=CHANGE_THIS_TO_A_LONG_RANDOM_STRING"
+Environment="PATH=/opt/kaizen/venv/bin"
+ExecStartPre=/opt/kaizen/venv/bin/python manage.py migrate --noinput
+ExecStartPre=/opt/kaizen/venv/bin/python manage.py collectstatic --noinput
+ExecStart=/opt/kaizen/venv/bin/gunicorn --config /opt/kaizen/gunicorn.conf.py kaizen.wsgi:application
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kaizen
+
+[Install]
+WantedBy=multi-user.target
