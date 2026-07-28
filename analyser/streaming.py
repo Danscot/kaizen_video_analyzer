@@ -1,27 +1,18 @@
 """
 analyser/streaming.py
-SSE generator pipelines for content and visual analysis.
+SSE generator pipelines with full logging at every stage.
 
-KEY DESIGN DECISIONS FOR RELIABLE STREAMING:
-- Every yield is a complete SSE message (event + data + double newline).
-- We close the Django DB connection before long-running AI calls so SQLite
-  is not held open across Whisper/Gemini/OpenCV (which can take minutes).
-- Every blocking call (Whisper, ffmpeg, OpenCV, Gemini, Gemma) runs through
-  _run_blocking(), which drives run_with_heartbeat() on a background thread
-  and yields a "heartbeat" SSE event every 2 seconds while it's in flight.
-  This guarantees the client sees continuous proof-of-life regardless of
-  how long the real work takes, and a hard per-stage ceiling means a truly
-  hung network call (e.g. Whisper's first-run model download with no
-  internet access) surfaces as a clear error instead of freezing the UI.
-- `yield from _run_blocking(...)` forwards heartbeat events to the caller
-  AND captures the blocking call's return value via PEP 380 generator
-  return semantics — no extra plumbing needed.
+Every stage logs to the `kaizen.streaming` logger which writes to both
+the terminal (colour-coded) and logs/kaizen.log. Errors always log the
+full traceback so you never have to guess what failed.
 """
 import json
+import logging
 import os
 import sys
 import io
 import tempfile
+import traceback
 import uuid
 from pathlib import Path
 from contextlib import redirect_stdout, redirect_stderr
@@ -39,32 +30,25 @@ from core.design_context   import build_design_context, format_as_markdown
 
 from .heartbeat import run_with_heartbeat
 
+logger = logging.getLogger("kaizen.streaming")
+
 SUPPORTED_VIDEO = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp", ".ts"}
 SUPPORTED_AUDIO = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".opus", ".wma"}
 
-# Per-stage hard ceiling in seconds. Generous, but not infinite — a real
-# network hang (e.g. no internet for Whisper's first-run model download,
-# or a stalled Gemini/Gemma request) surfaces as a clear error rather than
-# freezing the UI forever.
 TRANSCRIBE_MAX_SECONDS = 20 * 60
 ANALYSE_MAX_SECONDS    = 5  * 60
 EXTRACT_MAX_SECONDS    = 10 * 60
 VISION_MAX_SECONDS     = 15 * 60
-
-HEARTBEAT_INTERVAL = 2.0   # seconds between "still working" pings
+HEARTBEAT_INTERVAL     = 2.0
 
 
 # ── SSE helpers ───────────────────────────────────────────────────────────────
 
 def sse(event: str, data: dict) -> str:
-    """Format one complete SSE message."""
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
 def _close_db():
-    """Close the DB connection before a long blocking call so SQLite isn't
-    held open across it. Django reopens the connection automatically on the
-    next ORM access."""
     try:
         db_connection.close()
     except Exception:
@@ -72,7 +56,6 @@ def _close_db():
 
 
 def _save_tmp(uploaded_file) -> Path:
-    """Save a Django UploadedFile to the uploads temp directory."""
     upload_dir = Path(settings.MEDIA_ROOT) / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     suffix = Path(uploaded_file.name).suffix.lower()
@@ -85,13 +68,9 @@ def _save_tmp(uploaded_file) -> Path:
 
 def _run_blocking(fn, args, kwargs, step, base_message, max_seconds):
     """
-    Generator wrapper around run_with_heartbeat():
-      - yields sse("heartbeat", ...) every HEARTBEAT_INTERVAL seconds
-      - raises the original exception if the blocking call failed
-      - `return`s the blocking call's result (captured by the caller via
-        `result = yield from _run_blocking(...)`)
-    All stdout/stderr from third-party libraries (Whisper, OpenCV, yt-dlp)
-    is suppressed during the call so it doesn't leak into server logs.
+    Runs a blocking call on a background thread. Yields SSE heartbeat
+    events every HEARTBEAT_INTERVAL seconds and logs them to the terminal
+    so the operator can see the pipeline is alive without opening a browser.
     """
     devnull = io.StringIO()
     with redirect_stdout(devnull), redirect_stderr(devnull):
@@ -100,8 +79,9 @@ def _run_blocking(fn, args, kwargs, step, base_message, max_seconds):
             interval=HEARTBEAT_INTERVAL, max_seconds=max_seconds,
         ):
             if kind == "heartbeat":
+                logger.debug(f"[{step}] still running — {payload}s elapsed")
                 yield sse("heartbeat", {
-                    "step": step,
+                    "step":    step,
                     "elapsed": payload,
                     "message": f"{base_message} ({payload}s elapsed)",
                 })
@@ -111,66 +91,92 @@ def _run_blocking(fn, args, kwargs, step, base_message, max_seconds):
                 return payload
 
 
+def _log_error(job_id: str, step: str, exc: Exception) -> None:
+    """
+    Log a pipeline error with full traceback to both the terminal and the
+    log file. This is the single place that ensures no error is ever silent.
+    """
+    tb = traceback.format_exc()
+    logger.error(
+        f"Job {str(job_id)[:8]} FAILED at step '{step}': {exc}\n{tb}"
+    )
+
+
 # ── Content pipeline ──────────────────────────────────────────────────────────
 
 def stream_content(job, source_path: Path, is_audio: bool):
-    """
-    Yields SSE strings for the content analysis pipeline:
-      transcribe (heartbeat) -> Gemini content analysis (heartbeat) -> complete
-    """
     from .models import AnalysisJob
     current_step = "transcribe"
 
+    logger.info(
+        f"Job {job.short_id} START content — "
+        f"file={source_path.name!r} audio={is_audio} "
+        f"whisper={job.whisper_model} gemini={job.gemini_model}"
+    )
+
     try:
         # ── Step 1: Transcribe ────────────────────────────────────────────────
+        logger.info(f"Job {job.short_id} [transcribe] starting Whisper ({job.whisper_model})")
         yield sse("status", {
-            "step": "transcribe",
+            "step":    "transcribe",
             "message": f"Transcribing with Whisper ({job.whisper_model})...",
         })
 
         _close_db()
 
         if is_audio:
+            transcribe_fn     = transcribe_audio
             transcribe_kwargs = {"whisper_model": job.whisper_model}
-            transcribe_fn = transcribe_audio
         else:
+            transcribe_fn     = transcribe_video
             transcribe_kwargs = {"whisper_model": job.whisper_model, "keep_audio": False}
-            transcribe_fn = transcribe_video
 
         transcript = yield from _run_blocking(
             transcribe_fn, (source_path,), transcribe_kwargs,
             step="transcribe",
-            base_message="Transcribing (first run may download the Whisper model)",
+            base_message="Transcribing (first run downloads the Whisper model — may take a minute)",
             max_seconds=TRANSCRIBE_MAX_SECONDS,
         )
 
         if not transcript:
-            raise ValueError("Transcription returned no text. The audio may be silent or unreadable.")
+            raise ValueError(
+                "Transcription returned empty text. "
+                "The audio may be silent, corrupted, or in an unsupported format."
+            )
 
         word_count = len(transcript.split())
+        logger.info(f"Job {job.short_id} [transcribe] done — {word_count} words")
+
         AnalysisJob.objects.filter(pk=job.pk).update(
             transcript=transcript,
             word_count=word_count,
         )
-
         yield sse("transcript", {"text": transcript, "word_count": word_count})
 
-        # ── Step 2: Gemini content analysis ───────────────────────────────────
+        # ── Step 2: Gemini analysis ───────────────────────────────────────────
         current_step = "analyse"
+        logger.info(f"Job {job.short_id} [analyse] sending to Gemini ({job.gemini_model})")
         yield sse("status", {
-            "step": "analyse",
+            "step":    "analyse",
             "message": f"Analysing with Gemini ({job.gemini_model})...",
         })
 
         _close_db()
 
         analysis = yield from _run_blocking(
-            analyse_transcript,
-            (),
-            {"transcript": transcript, "video_name": job.source_name, "gemini_model": job.gemini_model},
+            analyse_transcript, (),
+            {"transcript": transcript, "video_name": job.source_name,
+             "gemini_model": job.gemini_model},
             step="analyse",
             base_message="Analysing with Gemini",
             max_seconds=ANALYSE_MAX_SECONDS,
+        )
+
+        logger.info(
+            f"Job {job.short_id} [analyse] done — "
+            f"title={analysis.get('title','?')!r} "
+            f"hooks={len(analysis.get('hooks',[]))} "
+            f"scenes={len(analysis.get('scenes',[]))}"
         )
 
         AnalysisJob.objects.filter(pk=job.pk).update(
@@ -178,6 +184,7 @@ def stream_content(job, source_path: Path, is_audio: bool):
             status="complete",
         )
 
+        logger.info(f"Job {job.short_id} COMPLETE content")
         yield sse("complete", {
             "job_id":     str(job.id),
             "analysis":   analysis,
@@ -185,13 +192,18 @@ def stream_content(job, source_path: Path, is_audio: bool):
         })
 
     except Exception as exc:
+        _log_error(job.id, current_step, exc)
         try:
             AnalysisJob.objects.filter(pk=job.pk).update(
-                status="error", error_message=str(exc),
+                status="error",
+                error_message=str(exc),
             )
-        except Exception:
-            pass
-        yield sse("error", {"message": str(exc), "step": current_step})
+        except Exception as db_exc:
+            logger.error(f"Job {job.short_id} could not save error to DB: {db_exc}")
+        yield sse("error", {
+            "message": str(exc),
+            "step":    current_step,
+        })
 
     finally:
         try:
@@ -203,21 +215,24 @@ def stream_content(job, source_path: Path, is_audio: bool):
 # ── Visual pipeline ───────────────────────────────────────────────────────────
 
 def stream_visual(job, source_path: Path):
-    """
-    Yields SSE strings for the visual analysis pipeline:
-      frame extraction (heartbeat) -> Gemma vision (heartbeat) -> design context -> complete
-    """
     from .models import AnalysisJob
     current_step = "extract"
 
-    try:
-        threshold  = float(getattr(job, "_threshold",  5.0))
-        min_gap    = int(getattr(job,   "_min_gap",    30))
-        batch_size = int(getattr(job,   "_batch_size", 8))
+    threshold  = float(getattr(job, "_threshold",  5.0))
+    min_gap    = int(getattr(job,   "_min_gap",    30))
+    batch_size = int(getattr(job,   "_batch_size", 8))
 
+    logger.info(
+        f"Job {job.short_id} START visual — "
+        f"file={source_path.name!r} gemma={job.gemma_model} "
+        f"threshold={threshold} min_gap={min_gap} batch={batch_size}"
+    )
+
+    try:
         # ── Step 1: Frame extraction ──────────────────────────────────────────
+        logger.info(f"Job {job.short_id} [extract] starting OpenCV frame extraction")
         yield sse("status", {
-            "step": "extract",
+            "step":    "extract",
             "message": f"Extracting key frames (sensitivity={threshold})...",
         })
 
@@ -233,8 +248,13 @@ def stream_visual(job, source_path: Path):
         )
 
         if not frames:
-            raise ValueError("No frames extracted. Try lowering the frame sensitivity.")
+            raise ValueError(
+                "No frames were extracted from this video. "
+                "Try lowering the frame sensitivity slider, or check that "
+                "the file is a valid video with visual content."
+            )
 
+        logger.info(f"Job {job.short_id} [extract] done — {len(frames)} frames extracted")
         yield sse("frames_extracted", {
             "count":         len(frames),
             "frame_indices": [f[0] for f in frames],
@@ -242,8 +262,12 @@ def stream_visual(job, source_path: Path):
 
         # ── Step 2: Gemma vision ──────────────────────────────────────────────
         current_step = "vision"
+        logger.info(
+            f"Job {job.short_id} [vision] sending {len(frames)} frames "
+            f"to Gemma ({job.gemma_model}) in batches of {batch_size}"
+        )
         yield sse("status", {
-            "step": "vision",
+            "step":    "vision",
             "message": f"Sending {len(frames)} frames to Gemma ({job.gemma_model})...",
         })
 
@@ -259,11 +283,22 @@ def stream_visual(job, source_path: Path):
         )
 
         total_scenes = sum(len(b["scenes"]) for b in raw_visual["batches"])
+        failed_batches = sum(1 for b in raw_visual["batches"] if b.get("error"))
+        logger.info(
+            f"Job {job.short_id} [vision] done — "
+            f"{total_scenes} scenes analysed, {failed_batches} batch error(s)"
+        )
+        if failed_batches:
+            logger.warning(
+                f"Job {job.short_id} [vision] {failed_batches} batch(es) failed — "
+                "partial results will still be saved."
+            )
 
-        # ── Step 3: Design context (fast, local — no heartbeat needed) ────────
+        # ── Step 3: Design context ────────────────────────────────────────────
         current_step = "context"
+        logger.info(f"Job {job.short_id} [context] building design context")
         yield sse("status", {
-            "step": "context",
+            "step":    "context",
             "message": f"Building design context from {total_scenes} scenes...",
         })
 
@@ -279,6 +314,7 @@ def stream_visual(job, source_path: Path):
             status="complete",
         )
 
+        logger.info(f"Job {job.short_id} COMPLETE visual")
         yield sse("complete", {
             "job_id":           str(job.id),
             "design_context":   design_ctx,
@@ -288,13 +324,18 @@ def stream_visual(job, source_path: Path):
         })
 
     except Exception as exc:
+        _log_error(job.id, current_step, exc)
         try:
             AnalysisJob.objects.filter(pk=job.pk).update(
-                status="error", error_message=str(exc),
+                status="error",
+                error_message=str(exc),
             )
-        except Exception:
-            pass
-        yield sse("error", {"message": str(exc), "step": current_step})
+        except Exception as db_exc:
+            logger.error(f"Job {job.short_id} could not save error to DB: {db_exc}")
+        yield sse("error", {
+            "message": str(exc),
+            "step":    current_step,
+        })
 
     finally:
         try:
@@ -306,10 +347,7 @@ def stream_visual(job, source_path: Path):
 # ── URL download pipeline ─────────────────────────────────────────────────────
 
 def stream_fetch_url(url: str):
-    """
-    Downloads a video via yt-dlp (heartbeat-wrapped) and yields SSE events.
-    The final 'ready' event carries tmp_path + filename for the analysis views.
-    """
+    logger.info(f"URL download START — {url!r}")
     try:
         import yt_dlp
 
@@ -321,12 +359,12 @@ def stream_fetch_url(url: str):
         yield sse("status", {"step": "download", "message": "Fetching video from URL..."})
 
         ydl_opts = {
-            "format":       "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-            "outtmpl":      str(tmp_path) + ".%(ext)s",
-            "quiet":        True,
-            "no_warnings":  True,
-            "noplaylist":   True,
-            "max_filesize": 640 * 1024 * 1024,
+            "format":         "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "outtmpl":        str(tmp_path) + ".%(ext)s",
+            "quiet":          True,
+            "no_warnings":    True,
+            "noplaylist":     True,
+            "max_filesize":   640 * 1024 * 1024,
             "socket_timeout": 30,
         }
 
@@ -350,6 +388,7 @@ def stream_fetch_url(url: str):
         size_mb  = round(dl_path.stat().st_size / 1024 / 1024, 1)
         filename = f"{title}{dl_path.suffix}"
 
+        logger.info(f"URL download DONE — {filename!r} ({size_mb} MB)")
         yield sse("downloaded", {
             "filename": filename,
             "size_mb":  size_mb,
@@ -358,4 +397,6 @@ def stream_fetch_url(url: str):
         yield sse("ready", {"tmp_path": str(dl_path), "filename": filename})
 
     except Exception as exc:
-        yield sse("error", {"message": str(exc)})
+        tb = traceback.format_exc()
+        logger.error(f"URL download FAILED — {url!r}: {exc}\n{tb}")
+        yield sse("error", {"message": str(exc), "step": "download"})

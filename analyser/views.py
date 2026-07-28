@@ -1,18 +1,9 @@
 """
 analyser/views.py
-All HTTP views: index, SSE analysis streams, URL fetch, export downloads,
-and the job history JSON API.
-
-SSE STREAMING NOTE:
-Django's StreamingHttpResponse with a sync Gunicorn worker will flush each
-yielded chunk immediately as long as:
-  1. No buffering middleware wraps the response (see settings.MIDDLEWARE).
-  2. The generator yields frequently — we yield a status event before every
-     blocking call so the client always gets a heartbeat.
-  3. nginx has proxy_buffering off (see nginx.conf).
-  4. Gunicorn has --timeout high enough (600s in gunicorn.conf.py).
+All HTTP views: index, SSE streams, exports, job history API.
 """
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -31,35 +22,66 @@ from .streaming import (
     _save_tmp, SUPPORTED_AUDIO, sse,
 )
 
+logger = logging.getLogger("kaizen.views")
 
-def _check_api_key():
-    if not settings.GEMINI_API_KEY:
-        return JsonResponse(
-            {"error": "GEMINI_API_KEY is not configured on the server."},
-            status=500,
-        )
-    return None
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _streaming_response(generator):
     """
-    Wrap a generator in a StreamingHttpResponse with the correct headers
-    to prevent any intermediate buffering.
+    Wrap a generator in a StreamingHttpResponse.
+    NOTE: 'Connection' and 'Transfer-Encoding' are hop-by-hop headers —
+    the WSGI server manages them. Setting them here raises AssertionError
+    under wsgiref (manage.py runserver). Never set them in app code.
     """
     resp = StreamingHttpResponse(generator, content_type="text/event-stream")
     resp["Cache-Control"]     = "no-cache, no-transform"
-    resp["X-Accel-Buffering"] = "no"           # tells nginx not to buffer
-    # NOTE: 'Connection' and 'Transfer-Encoding' are hop-by-hop headers.
-    # WSGI servers (gunicorn, wsgiref/runserver) manage these themselves —
-    # setting them from the application raises AssertionError under wsgiref
-    # and is silently stripped/rejected by most WSGI servers. Never set them here.
+    resp["X-Accel-Buffering"] = "no"
     return resp
+
+
+def _sse_error_stream(message: str, code: str = "config_error"):
+    """
+    Return a StreamingHttpResponse that immediately yields a single SSE
+    error event. Use this instead of JsonResponse inside streaming endpoints
+    so the frontend SSE parser actually receives and displays the error —
+    JsonResponse bodies are silently ignored by the SSE client.
+    """
+    logger.error(f"Pre-stream error [{code}]: {message}")
+    def _gen():
+        yield sse("error", {"message": message, "code": code, "step": "init"})
+    return _streaming_response(_gen())
+
+
+def _api_key_missing_response():
+    """
+    Returns the appropriate error response for a missing GEMINI_API_KEY.
+    For streaming endpoints this MUST be an SSE stream, not a JsonResponse.
+    """
+    msg = (
+        "GEMINI_API_KEY is not configured on the server. "
+        "Set the environment variable and restart the server."
+    )
+    return _sse_error_stream(msg, code="missing_api_key")
 
 
 # ── Index ─────────────────────────────────────────────────────────────────────
 
 def index(request):
-    return render(request, "analyser/index.html")
+    # Pass config state to template so the UI can show a persistent banner
+    # if the API key is missing — visible immediately on page load, not only
+    # after a user tries to run an analysis.
+    ctx = {
+        "api_key_missing": not bool(settings.GEMINI_API_KEY),
+        "ffmpeg_missing":  not _check_ffmpeg(),
+    }
+    logger.debug(f"index loaded — config_ok={not ctx['api_key_missing']}")
+    return render(request, "analyser/index.html", ctx)
+
+
+def _check_ffmpeg() -> bool:
+    import shutil
+    return shutil.which("ffmpeg") is not None
 
 
 # ── Content analysis ──────────────────────────────────────────────────────────
@@ -67,9 +89,8 @@ def index(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def analyse_content(request):
-    err = _check_api_key()
-    if err:
-        return err
+    if not settings.GEMINI_API_KEY:
+        return _api_key_missing_response()
 
     tmp_path_str = request.POST.get("tmp_path", "").strip()
     if tmp_path_str:
@@ -77,7 +98,7 @@ def analyse_content(request):
         source_name = request.POST.get("filename", source_path.name)
     else:
         if "file" not in request.FILES:
-            return JsonResponse({"error": "No file provided."}, status=400)
+            return _sse_error_stream("No file provided.", code="no_file")
         uploaded    = request.FILES["file"]
         source_name = uploaded.name
         source_path = _save_tmp(uploaded)
@@ -86,8 +107,12 @@ def analyse_content(request):
 
     os.environ["GEMINI_API_KEY"] = settings.GEMINI_API_KEY
 
-    # Create job record BEFORE starting the stream so the DB write
-    # completes while the connection is still open.
+    logger.info(
+        f"Content request — file={source_name!r} is_audio={is_audio} "
+        f"whisper={request.POST.get('whisper_model','base')} "
+        f"gemini={request.POST.get('gemini_model','gemini-2.5-flash')}"
+    )
+
     job = AnalysisJob.objects.create(
         source_name   = source_name,
         source_url    = request.POST.get("source_url", ""),
@@ -98,7 +123,6 @@ def analyse_content(request):
     )
 
     def event_stream():
-        # Send job_id immediately so frontend can set up export links early
         yield sse("job_created", {"job_id": str(job.id)})
         yield from stream_content(job, source_path, is_audio)
 
@@ -110,9 +134,8 @@ def analyse_content(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def analyse_visual(request):
-    err = _check_api_key()
-    if err:
-        return err
+    if not settings.GEMINI_API_KEY:
+        return _api_key_missing_response()
 
     tmp_path_str = request.POST.get("tmp_path", "").strip()
     if tmp_path_str:
@@ -120,12 +143,17 @@ def analyse_visual(request):
         source_name = request.POST.get("filename", source_path.name)
     else:
         if "file" not in request.FILES:
-            return JsonResponse({"error": "No file provided."}, status=400)
+            return _sse_error_stream("No file provided.", code="no_file")
         uploaded    = request.FILES["file"]
         source_name = uploaded.name
         source_path = _save_tmp(uploaded)
 
     os.environ["GEMINI_API_KEY"] = settings.GEMINI_API_KEY
+
+    logger.info(
+        f"Visual request — file={source_name!r} "
+        f"gemma={request.POST.get('gemma_model','gemma-4-31b-it')}"
+    )
 
     job = AnalysisJob.objects.create(
         source_name = source_name,
@@ -135,7 +163,6 @@ def analyse_visual(request):
         gemma_model = request.POST.get("gemma_model", "gemma-4-31b-it"),
     )
 
-    # Stash tuning params as transient attrs — not DB fields
     job._threshold  = float(request.POST.get("threshold",  "5.0"))
     job._min_gap    = int(request.POST.get("min_gap",      "30"))
     job._batch_size = int(request.POST.get("batch_size",   "8"))
@@ -152,9 +179,8 @@ def analyse_visual(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def fetch_url(request):
-    err = _check_api_key()
-    if err:
-        return err
+    if not settings.GEMINI_API_KEY:
+        return _api_key_missing_response()
 
     try:
         body = json.loads(request.body)
@@ -163,7 +189,9 @@ def fetch_url(request):
 
     url = (body.get("url") or request.POST.get("url", "")).strip()
     if not url:
-        return JsonResponse({"error": "No URL provided."}, status=400)
+        return _sse_error_stream("No URL provided.", code="no_url")
+
+    logger.info(f"URL fetch request — {url!r}")
 
     def event_stream():
         yield from stream_fetch_url(url)
@@ -178,6 +206,7 @@ def download_json(request, job_id):
     data     = job.to_export_dict()
     stem     = Path(job.source_name).stem or "analysis"
     filename = f"{stem}_{job.track}_analysis.json"
+    logger.info(f"JSON export — job={job.short_id} file={filename!r}")
     response = HttpResponse(
         json.dumps(data, indent=2, ensure_ascii=False),
         content_type="application/json",
@@ -195,9 +224,11 @@ def download_pdf(request, job_id):
         from core.pdf_exporter import export_pdf
         pdf_bytes = export_pdf(data, track=job.track)
     except Exception as exc:
+        logger.error(f"PDF export failed — job={job.short_id}: {exc}", exc_info=True)
         return JsonResponse({"error": f"PDF generation failed: {exc}"}, status=500)
     stem     = Path(job.source_name).stem or "analysis"
     filename = f"{stem}_{job.track}_brief.pdf"
+    logger.info(f"PDF export — job={job.short_id} file={filename!r}")
     response = HttpResponse(pdf_bytes, content_type="application/pdf")
     response["Content-Disposition"] = f'attachment; filename="{filename}"'
     return response
@@ -219,6 +250,7 @@ def job_list(request):
                 "word_count":  j.word_count,
                 "frames":      j.frames_extracted,
                 "scenes":      j.scenes_analysed,
+                "error":       j.error_message,
             }
             for j in jobs
         ]
@@ -239,7 +271,7 @@ def job_detail(request, job_id):
 @csrf_exempt
 @require_http_methods(["POST", "DELETE"])
 def job_delete(request, job_id):
-    """Delete a single analysis job and its DB record."""
     job = get_object_or_404(AnalysisJob, id=job_id)
+    logger.info(f"Delete job {job.short_id} ({job.source_name!r})")
     job.delete()
     return JsonResponse({"deleted": True, "job_id": str(job_id)})

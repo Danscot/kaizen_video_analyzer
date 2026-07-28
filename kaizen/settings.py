@@ -2,6 +2,7 @@
 kaizen/settings.py
 """
 import os
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,11 +26,11 @@ INSTALLED_APPS = [
 
 # ── Middleware ─────────────────────────────────────────────────────────────────
 # IMPORTANT: CommonMiddleware and XFrameOptionsMiddleware are intentionally
-# excluded — they wrap the response iterator and break SSE streaming by
-# buffering chunks before flushing them to the client.
+# excluded — they wrap the response iterator and break SSE streaming.
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
+    "analyser.middleware.RequestLogMiddleware",
 ]
 
 ROOT_URLCONF = "kaizen.urls"
@@ -50,9 +51,6 @@ TEMPLATES = [
 WSGI_APPLICATION = "kaizen.wsgi.application"
 
 # ── Database ──────────────────────────────────────────────────────────────────
-# ATOMIC_REQUESTS=False and CONN_MAX_AGE=0 are critical for SSE:
-# ATOMIC_REQUESTS wraps every request in a transaction that holds the DB
-# connection open for the full stream duration, which deadlocks on SQLite.
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
@@ -90,3 +88,78 @@ if not DEBUG:
     SECURE_BROWSER_XSS_FILTER   = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     SECURE_PROXY_SSL_HEADER     = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Two handlers:
+#   console  — always on, colour-coded by level (ANSI codes, safe on any terminal)
+#   file     — rotating file at logs/kaizen.log, persists across restarts
+#
+# Three loggers:
+#   kaizen   — our application code (streaming, views, startup checks)
+#   django   — Django internals (request/response, ORM errors)
+#   root     — catch-all for third-party libs
+
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True)
+
+_IS_TTY = hasattr(sys.stderr, "isatty") and sys.stderr.isatty()
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+
+    "formatters": {
+        "console_colour": {
+            "()": "analyser.log_formatter.ColourFormatter",
+        },
+        "file_plain": {
+            "format": "[{asctime}] {levelname:<8} {name} — {message}",
+            "style": "{",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "formatter": "console_colour",
+            "level": "DEBUG",
+        },
+        "file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "filename": str(LOG_DIR / "kaizen.log"),
+            "maxBytes": 10 * 1024 * 1024,   # 10 MB per file
+            "backupCount": 5,
+            "formatter": "file_plain",
+            "encoding": "utf-8",
+            "level": "DEBUG",
+        },
+    },
+
+    "loggers": {
+        # Our application — everything DEBUG and above
+        "kaizen": {
+            "handlers": ["console", "file"],
+            "level": "DEBUG",
+            "propagate": False,
+        },
+        # Django internals — INFO and above (avoids SQL noise)
+        "django": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "django.request": {
+            "handlers": ["console", "file"],
+            "level": "WARNING",
+            "propagate": False,
+        },
+    },
+
+    # Root logger — catches everything else (yt-dlp, google-genai, whisper…)
+    "root": {
+        "handlers": ["console", "file"],
+        "level": "WARNING",
+    },
+}
